@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TheBoringNVR</title>
+<style>
+:root{--bg:#111318;--card:#1b1e26;--card2:#232733;--tx:#e6e8ee;--mut:#8b91a1;--acc:#03a9f4;--ok:#43a047;--warn:#fb8c00;--bad:#e53935;--person:#2196f3;--animal:#ff9800;--vehicle:#9c27b0;--motion:#78909c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;gap:4px;padding:10px 14px;background:var(--card);position:sticky;top:0;z-index:5;align-items:center;flex-wrap:wrap}
+header h1{font-size:16px;margin:0 14px 0 0;font-weight:600}
+nav button{background:none;border:0;color:var(--mut);padding:8px 12px;border-radius:8px;cursor:pointer;font-size:14px}
+nav button.on{background:var(--card2);color:var(--tx)}
+main{padding:14px;max-width:1200px;margin:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.card{background:var(--card);border-radius:14px;overflow:hidden;position:relative}
+.card img.snap{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:#000}
+.badge{position:absolute;left:8px;bottom:56px;width:46px;height:46px;border-radius:50%;border:2px solid #fff;box-shadow:0 2px 8px #0008;object-fit:cover;background:var(--card2)}
+.dot{position:absolute;right:8px;top:8px;width:12px;height:12px;border-radius:50%;box-shadow:0 0 0 2px #0009}
+.meta{padding:8px 10px}.meta b{display:block}.meta span{color:var(--mut);font-size:12px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.chip{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid #0000;border-radius:20px;padding:4px 12px 4px 4px;cursor:pointer;color:var(--tx)}
+.chip.on{border-color:var(--acc)}.chip img{width:26px;height:26px;border-radius:50%;object-fit:cover}
+.chip.plain{padding:6px 12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,select{background:var(--card2);border:1px solid #0000;color:var(--tx);padding:8px 10px;border-radius:8px;font:inherit}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+button.btn{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font:inherit}
+button.btn.sec{background:var(--card2);color:var(--tx)}button.btn.bad{background:var(--bad)}
+.panel{background:var(--card);border-radius:14px;padding:14px;margin-bottom:12px}
+.panel h3{margin:0 0 10px;font-size:15px}
+.f{display:grid;grid-template-columns:150px 1fr;gap:8px;align-items:center;margin-bottom:8px}
+.avatar{width:64px;height:64px;border-radius:50%;object-fit:cover;background:var(--card2)}
+.pcard{display:flex;gap:12px;align-items:center}.pcard .grow{flex:1}
+.ok{color:var(--ok)}.bad{color:var(--bad)}pre{background:var(--card2);padding:10px;border-radius:8px;overflow:auto;font-size:12px}
+.hidden{display:none}video{width:100%;border-radius:10px;background:#000}
+dialog{background:var(--card);color:var(--tx);border:0;border-radius:14px;max-width:720px;width:92%}
+dialog::backdrop{background:#000a}
+</style>
+</head>
+<body>
+<header>
+  <h1>● TheBoringNVR</h1>
+  <nav id="nav">
+    <button data-t="events" class="on">Events</button>
+    <button data-t="faces">Faces</button>
+    <button data-t="cameras">Cameras</button>
+    <button data-t="settings">Settings</button>
+  </nav>
+</header>
+<main id="main"></main>
+<dialog id="dlg"></dialog>
+
+<script>
+// Works behind HA Ingress (relative URLs) and on the direct port (?token=… or stored token).
+const BASE = location.pathname.replace(/[^/]*$/, '');
+const qs = new URLSearchParams(location.search);
+if (qs.get('token')) localStorage.setItem('nvr_token', qs.get('token'));
+const TOKEN = localStorage.getItem('nvr_token') || '';
+const url = p => BASE + p.replace(/^\//, '') + (TOKEN ? (p.includes('?') ? '&' : '?') + 'token=' + TOKEN : '');
+const api = async (p, o = {}) => {
+  const r = await fetch(url('api/' + p), o.body && !(o.body instanceof FormData) ?
+    {...o, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(o.body)} : o);
+  if (!r.ok) throw new Error((await r.text()) || r.status);
+  return r.json();
+};
+const media = p => p ? url(p.replace(/^\//, '')) : '';
+const COL = {person:'var(--person)', animal:'var(--animal)', vehicle:'var(--vehicle)', motion:'var(--motion)'};
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = ts => new Date(ts * 1000).toLocaleString();
+
+let tab = 'events', filter = {person: '', camera: ''}, es;
+
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#nav button').forEach(x => x.classList.toggle('on', x === b));
+  tab = b.dataset.t; render();
+});
+
+async function render() {
+  const m = $('#main'); m.innerHTML = '';
+  try { await ({events: viewEvents, faces: viewFaces, cameras: viewCameras, settings: viewSettings})[tab](m); }
+  catch (e) { m.innerHTML = `<div class="panel bad">${esc(e.message)}</div>`; }
+}
+
+// ---------------------------------------------------------------- events
+async function viewEvents(m) {
+  const [persons, cams] = await Promise.all([api('persons'), api('cameras')]);
+  const chips = [['', null, 'All'], ['any', null, 'Known'], ['unknown', null, 'Unknown'],
+                 ...persons.map(p => [String(p.id), p.avatar, p.name])];
+  m.innerHTML = `<div class="chips">${chips.map(([v, a, n]) =>
+      `<button class="chip ${a ? '' : 'plain'} ${filter.person === v ? 'on' : ''}" data-p="${v}">${a ? `<img src="${media(a)}">` : ''}${esc(n)}</button>`).join('')}
+    <select id="cam"><option value="">All cameras</option>${cams.map(c => `<option value="${c.id}" ${filter.camera === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></div>
+    <div class="grid" id="evs"></div>`;
+  m.querySelectorAll('.chip').forEach(c => c.onclick = () => { filter.person = c.dataset.p; render(); });
+  $('#cam').onchange = e => { filter.camera = e.target.value; render(); };
+  const q = new URLSearchParams({limit: 80, ...(filter.person && {person: filter.person}), ...(filter.camera && {camera: filter.camera})});
+  const evs = await api('events?' + q);
+  $('#evs').innerHTML = evs.map(evCard).join('') || '<div class="panel">No events yet.</div>';
+  $('#evs').querySelectorAll('.card').forEach(c => c.onclick = () => openEvent(evs.find(e => e.id == c.dataset.id)));
+  if (es) es.close();
+  es = new EventSource(url('api/events/stream'));
+  es.onmessage = () => { if (tab === 'events') render(); };
+}
+function evCard(e) {
+  const who = e.person ? e.person.name : (e.type === 'person' ? (e.status === 'unknown' ? 'Unknown person' : 'Person') : e.type);
+  return `<div class="card" data-id="${e.id}" style="cursor:pointer">
+    ${e.snapshot ? `<img class="snap" loading="lazy" src="${media(e.snapshot)}">` : '<div class="snap" style="aspect-ratio:16/9"></div>'}
+    <span class="dot" style="background:${COL[e.type] || '#999'}"></span>
+    ${(e.face || e.person?.avatar) ? `<img class="badge" src="${media(e.person?.avatar || e.face)}">` : ''}
+    <div class="meta"><b>${esc(who)}</b><span>${esc(e.camera)} · ${fmt(e.ts)}${e.clip ? ' · ▶' : ''}</span></div></div>`;
+}
+function openEvent(e) {
+  const d = $('#dlg');
+  d.innerHTML = `<h3>${esc(e.person?.name || e.type)} — ${esc(e.camera)}</h3><p style="color:var(--mut)">${fmt(e.ts)}</p>
+    ${e.clip ? `<video src="${media(e.clip)}" controls autoplay muted playsinline></video>` : `<img src="${media(e.snapshot)}" style="width:100%;border-radius:10px">`}
+    <div class="row" style="margin-top:10px"><button class="btn bad" id="del">Delete</button><button class="btn sec" onclick="$('#dlg').close()">Close</button></div>`;
+  $('#del').onclick = async () => { await api('events/' + e.id, {method: 'DELETE'}); d.close(); render(); };
+  d.showModal();
+}
+
+// ---------------------------------------------------------------- faces
+async function viewFaces(m) {
+  const [persons, review] = await Promise.all([api('persons'), api('review')]);
+  m.innerHTML = `<div class="panel"><h3>Review queue (${review.length})</h3><div class="grid" id="rq"></div></div>
+    <div class="panel"><h3>People</h3>
+      <div class="row" style="margin-bottom:12px"><input id="np" placeholder="New person name"><button class="btn" id="addp">Add</button></div>
+      <div id="pl"></div></div>`;
+  $('#rq').innerHTML = review.map(r => `<div class="card" style="padding:12px;text-align:center">
+      <img class="avatar" src="${media(r.face)}" style="width:96px;height:96px"><div class="meta"><span>${esc(r.camera)} · ${r.ts ? fmt(r.ts) : ''}${r.closest ? `<br>closest: ${esc(r.closest.name)} (${(r.score || 0).toFixed(2)})` : ''}</span></div>
+      <select data-r="${r.id}"><option value="">Assign to…</option>${persons.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}<option value="new">+ New person…</option></select>
+      <div class="row" style="justify-content:center;margin-top:8px"><button class="btn sec" data-ig="${r.id}">Ignore</button></div></div>`).join('') || '<span style="color:var(--mut)">Nothing to review.</span>';
+  $('#rq').querySelectorAll('select').forEach(s => s.onchange = async () => {
+    if (!s.value) return;
+    const body = s.value === 'new' ? {new_person_name: prompt('Name?') || ''} : {person_id: +s.value};
+    if (s.value === 'new' && !body.new_person_name) return render();
+    await api(`review/${s.dataset.r}/assign`, {method: 'POST', body}); render();
+  });
+  $('#rq').querySelectorAll('[data-ig]').forEach(b => b.onclick = async () => { await api(`review/${b.dataset.ig}/ignore`, {method: 'POST'}); render(); });
+  $('#addp').onclick = async () => { if ($('#np').value.trim()) { await api('persons', {method: 'POST', body: {name: $('#np').value}}); render(); } };
+  $('#pl').innerHTML = persons.map(p => `<div class="pcard" style="margin-bottom:10px">
+      ${p.avatar ? `<img class="avatar" src="${media(p.avatar)}">` : '<div class="avatar"></div>'}
+      <div class="grow"><b>${esc(p.name)}</b><br><span style="color:var(--mut)">${p.events} events · ${p.embeddings} face samples</span></div>
+      <label class="btn sec" style="cursor:pointer">Add photo<input type="file" accept="image/*" hidden data-ph="${p.id}"></label>
+      <button class="btn sec" data-rn="${p.id}">Rename</button><button class="btn bad" data-dl="${p.id}">Delete</button></div>`).join('');
+  $('#pl').querySelectorAll('[data-ph]').forEach(i => i.onchange = async () => {
+    const fd = new FormData(); fd.append('file', i.files[0]);
+    try { await api(`persons/${i.dataset.ph}/photos`, {method: 'POST', body: fd}); render(); } catch (e) { alert(e.message); }
+  });
+  $('#pl').querySelectorAll('[data-rn]').forEach(b => b.onclick = async () => { const n = prompt('New name?'); if (n) { await api('persons/' + b.dataset.rn, {method: 'PATCH', body: {name: n}}); render(); } });
+  $('#pl').querySelectorAll('[data-dl]').forEach(b => b.onclick = async () => { if (confirm('Delete person and all face samples?')) { await api('persons/' + b.dataset.dl, {method: 'DELETE'}); render(); } });
+}
+
+// ---------------------------------------------------------------- cameras
+async function viewCameras(m) {
+  const cams = await api('cameras');
+  m.innerHTML = `<div id="cl"></div><div class="panel"><h3>Add / edit camera</h3><form id="cf">
+    <div class="f"><label>Name</label><input name="name" required placeholder="front_door"></div>
+    <div class="f"><label>Mode</label><select name="mode"><option value="reolink">Reolink (HTTP API)</option><option value="webhook">Webhook only</option></select></div>
+    <div class="f"><label>Host / IP</label><input name="host" placeholder="192.168.1.20"></div>
+    <div class="f"><label>Port (optional)</label><input name="port" type="number" placeholder="80 / 443"></div>
+    <div class="f"><label>HTTPS</label><input name="https" type="checkbox" style="justify-self:start"></div>
+    <div class="f"><label>Username</label><input name="username" value="admin"></div>
+    <div class="f"><label>Password</label><input name="password" type="password" placeholder="(unchanged if empty)"></div>
+    <div class="f"><label>Channel</label><input name="channel" type="number" value="0"></div>
+    <div class="f"><label>go2rtc stream name</label><input name="go2rtc_src" placeholder="same as name"></div>
+    <div class="row"><button class="btn" type="submit">Save</button><button class="btn sec" type="button" id="tst">Test</button></div>
+    <pre id="tr" class="hidden"></pre></form></div>`;
+  $('#cl').innerHTML = cams.map(c => `<div class="panel pcard"><div class="grow"><b>${esc(c.name)}</b> <span style="color:var(--mut)">${esc(c.mode)} ${esc(c.host || '')}</span><br>
+      <span class="${c.status?.connected ? 'ok' : 'bad'}">${c.mode === 'webhook' ? 'webhook' : c.status?.connected ? 'connected' : esc(c.status?.error || 'connecting…')}</span></div>
+      <button class="btn sec" data-ed="${c.id}">Edit</button><button class="btn bad" data-dl="${c.id}">Delete</button></div>`).join('');
+  const f = $('#cf'), read = () => { const o = Object.fromEntries(new FormData(f)); o.https = f.https.checked; o.port = o.port ? +o.port : null; o.channel = +o.channel || 0; return o; };
+  f.onsubmit = async ev => { ev.preventDefault(); const o = read(), ex = cams.find(c => c.name === o.name);
+    await api(ex ? 'cameras/' + ex.id : 'cameras', {method: ex ? 'PUT' : 'POST', body: o}); render(); };
+  $('#tst').onclick = async () => { const r = $('#tr'); r.classList.remove('hidden'); r.textContent = 'testing…';
+    try { r.textContent = JSON.stringify(await api('cameras/test', {method: 'POST', body: read()}), null, 2); } catch (e) { r.textContent = e.message; } };
+  $('#cl').querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { const c = cams.find(x => x.id === b.dataset.ed);
+    for (const [k, v] of Object.entries(c)) { const i = f.elements[k]; if (i && k !== 'password') i.type === 'checkbox' ? i.checked = !!v : i.value = v ?? ''; } scrollTo(0, 1e5); });
+  $('#cl').querySelectorAll('[data-dl]').forEach(b => b.onclick = async () => { if (confirm('Delete camera?')) { await api('cameras/' + b.dataset.dl, {method: 'DELETE'}); render(); } });
+}
+
+// ---------------------------------------------------------------- settings
+const FIELDS = [
+  ['go2rtc_url', 'go2rtc URL', 'text'], ['go2rtc_rtsp_port', 'go2rtc RTSP port', 'number'],
+  ['pre_roll_seconds', 'Pre-roll (s, 2-4)', 'number'], ['post_roll_seconds', 'Post-roll (s)', 'number'],
+  ['frames_per_event', 'Frames per person event (3-5)', 'number'], ['frame_interval_ms', 'Frame interval (ms)', 'number'],
+  ['match_threshold', 'Match threshold (cosine)', 'number'], ['auto_learn_threshold', 'Auto-learn threshold (0 = off)', 'number'],
+  ['min_face_px', 'Min. face size (px)', 'number'], ['min_det_score', 'Min. detector score', 'number'],
+  ['event_cooldown_seconds', 'Event cooldown (s)', 'number'], ['retention_days', 'Retention (days, 0 = keep)', 'number']];
+async function viewSettings(m) {
+  const [s, sys] = await Promise.all([api('settings'), api('system')]);
+  m.innerHTML = `<div class="panel"><h3>Runtime settings</h3><form id="sf">${FIELDS.map(([k, l, t]) =>
+    `<div class="f"><label>${l}</label><input name="${k}" type="${t}" step="any" value="${esc(s[k])}"></div>`).join('')}
+    <button class="btn">Save</button></form></div>
+    <div class="panel"><h3>System</h3><p style="color:var(--mut)">Storage path, model, inference device and API token are set in the add-on configuration (Settings → Add-ons → TheBoringNVR → Configuration).</p>
+    <pre>storage: ${esc(sys.storage)}\nface engine: ${esc(sys.engine)}\nversion: ${esc(sys.version)}\nAPI token (for the Lovelace card): ${esc(sys.api_token)}</pre></div>`;
+  $('#sf').onsubmit = async e => { e.preventDefault(); const o = {};
+    for (const [k, , t] of FIELDS) o[k] = t === 'number' ? +e.target[k].value : e.target[k].value;
+    await api('settings', {method: 'PUT', body: o}); render(); };
+}
+render();
+</script>
+</body>
+</html>
