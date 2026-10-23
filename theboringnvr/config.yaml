@@ -1,0 +1,72 @@
+name: TheBoringNVR
+version: "0.1.1"
+slug: theboringnvr
+description: Event-driven NVR with HomeKit-Secure-Video-style face recognition for Reolink + go2rtc
+url: https://github.com/theboringalex/TheBoringNVR
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+init: false
+
+# Home Assistant sidebar panel via Ingress
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cctv
+panel_title: BoringNVR
+
+# Direct API port for the Lovelace card (browser -> add-on). Protected by api_token.
+ports:
+  8099/tcp: 8765
+ports_description:
+  8099/tcp: "NVR API for TheBoringCameraCardv2 (token protected)"
+
+# Recordings / snapshots / DB live here by default. Change storage_path to /media/... if you prefer.
+map:
+  - share:rw
+  - media:rw
+
+# Optional: pass the iGPU to OpenVINO (inference_device: GPU). Uncomment if /dev/dri exists on your host.
+# devices:
+#   - /dev/dri
+
+options:
+  storage_path: /share/theboringnvr
+  go2rtc_url: http://homeassistant.local:1984
+  go2rtc_rtsp_port: 8554
+  api_token: ""
+  pre_roll_seconds: 3
+  post_roll_seconds: 12
+  frames_per_event: 4
+  frame_interval_ms: 700
+  match_threshold: 0.45
+  auto_learn_threshold: 0.0
+  min_face_px: 60
+  min_det_score: 0.6
+  model_name: buffalo_l
+  inference_device: CPU
+  event_cooldown_seconds: 20
+  retention_days: 14
+  verify_tls: false
+  log_level: info
+
+schema:
+  storage_path: str
+  go2rtc_url: str
+  go2rtc_rtsp_port: port
+  api_token: password?
+  pre_roll_seconds: int(2,4)
+  post_roll_seconds: int(3,60)
+  frames_per_event: int(3,5)
+  frame_interval_ms: int(200,3000)
+  match_threshold: float(0.2,0.9)
+  auto_learn_threshold: float(0,1)
+  min_face_px: int(30,300)
+  min_det_score: float(0.3,0.99)
+  model_name: list(buffalo_l|buffalo_s|buffalo_sc)
+  inference_device: list(CPU|GPU|NPU|AUTO:GPU,CPU)
+  event_cooldown_seconds: int(0,300)
+  retention_days: int(0,365)
+  verify_tls: bool
+  log_level: list(debug|info|warning|error)
