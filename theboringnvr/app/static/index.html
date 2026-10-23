@@ -66,6 +66,10 @@ const api = async (p, o = {}) => {
 };
 const media = p => p ? url(p.replace(/^\//, '')) : '';
 const COL = {person:'var(--person)', animal:'var(--animal)', vehicle:'var(--vehicle)', motion:'var(--motion)'};
+const TYPES = [['person', 'Person'], ['vehicle', 'Vehicle'], ['animal', 'Animal'], ['motion', 'Motion']];
+const REC = {linked: ['⏺', 'camera recording linked'], pending: ['⏳', 'waiting for the camera recording'],
+             missing: ['⚠', 'no camera recording found'], none: ['', '']};
+const recIcon = e => { const r = REC[e.rec_status] || REC.none; return r[0] ? ` · <span title="${r[1]}">${r[0]}</span>` : ''; };
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = ts => new Date(ts * 1000).toLocaleString();
@@ -108,13 +112,24 @@ function evCard(e) {
     ${e.snapshot ? `<img class="snap" loading="lazy" src="${media(e.snapshot)}">` : '<div class="snap" style="aspect-ratio:16/9"></div>'}
     <span class="dot" style="background:${COL[e.type] || '#999'}"></span>
     ${(e.face || e.person?.avatar) ? `<img class="badge" src="${media(e.person?.avatar || e.face)}">` : ''}
-    <div class="meta"><b>${esc(who)}</b><span>${esc(e.camera)} · ${fmt(e.ts)}${e.clip ? ' · ▶' : ''}</span></div></div>`;
+    <div class="meta"><b>${esc(who)}</b><span>${esc(e.camera)} · ${fmt(e.ts)}${e.recording || e.clip ? ' · ▶' : ''}${recIcon(e)}</span></div></div>`;
 }
 function openEvent(e) {
   const d = $('#dlg');
+  // the camera's own recording is the primary source; the internal pre-roll clip is the fallback
+  const sources = [];
+  if (e.recording) sources.push(['Camera recording', media(e.recording) + '#t=' + Math.floor(e.rec_offset || 0)]);
+  if (e.clip) sources.push(['Pre-roll clip', media(e.clip)]);
+  const note = {pending: 'The camera recording has not been uploaded yet - it is linked automatically as soon as the file shows up.',
+                missing: 'No camera recording was found for this event (check the recording directory, time zone and FTP upload).'}[e.rec_status] || '';
   d.innerHTML = `<h3>${esc(e.person?.name || e.type)} — ${esc(e.camera)}</h3><p style="color:var(--mut)">${fmt(e.ts)}</p>
-    ${e.clip ? `<video src="${media(e.clip)}" controls autoplay muted playsinline></video>` : `<img src="${media(e.snapshot)}" style="width:100%;border-radius:10px">`}
-    <div class="row" style="margin-top:10px"><button class="btn bad" id="del">Delete</button><button class="btn sec" onclick="$('#dlg').close()">Close</button></div>`;
+    ${sources.length ? `<video id="vid" src="${sources[0][1]}" controls autoplay muted playsinline></video>` : `<img src="${media(e.snapshot)}" style="width:100%;border-radius:10px">`}
+    ${note ? `<p class="${e.rec_status === 'missing' ? 'bad' : ''}" style="font-size:12px">${note}</p>` : ''}
+    <div class="row" style="margin-top:10px">${sources.length > 1 ? sources.map((s, i) => `<button class="btn sec" data-src="${i}">${s[0]}</button>`).join('') : ''}
+      ${e.rec_status === 'pending' || e.rec_status === 'missing' ? '<button class="btn sec" id="rel">Search recording again</button>' : ''}
+      <button class="btn bad" id="del">Delete</button><button class="btn sec" onclick="$('#dlg').close()">Close</button></div>`;
+  d.querySelectorAll('[data-src]').forEach(b => b.onclick = () => { const v = $('#vid'); v.src = sources[+b.dataset.src][1]; v.play(); });
+  if ($('#rel')) $('#rel').onclick = async () => { await api(`events/${e.id}/relink`, {method: 'POST'}); d.close(); setTimeout(render, 1500); };
   $('#del').onclick = async () => { await api('events/' + e.id, {method: 'DELETE'}); d.close(); render(); };
   d.showModal();
 }
@@ -153,7 +168,8 @@ async function viewFaces(m) {
 
 // ---------------------------------------------------------------- cameras
 async function viewCameras(m) {
-  const cams = await api('cameras');
+  const [cams, gs] = await Promise.all([api('cameras'), api('settings')]);
+  const gev = gs.event_types || [];
   m.innerHTML = `<div id="cl"></div><div class="panel"><h3>Add / edit camera</h3><form id="cf">
     <div class="f"><label>Name</label><input name="name" required placeholder="front_door"></div>
     <div class="f"><label>Mode</label><select name="mode"><option value="reolink">Reolink (HTTP API)</option><option value="webhook">Webhook only</option></select></div>
@@ -164,18 +180,37 @@ async function viewCameras(m) {
     <div class="f"><label>Password</label><input name="password" type="password" placeholder="(unchanged if empty)"></div>
     <div class="f"><label>Channel</label><input name="channel" type="number" value="0"></div>
     <div class="f"><label>go2rtc stream name</label><input name="go2rtc_src" placeholder="same as name"></div>
+    <div class="f"><label>Recording directory</label><input name="recording_path" required placeholder="/media/reolink/front_door"></div>
+    <p style="color:var(--mut);font-size:12px;margin:-2px 0 10px">Folder where the camera stores its own recordings (FTP target, SMB/NFS share, ...). Must be below /media or /share. Every event is linked to the file covering its time stamp.</p>
+    <div class="f"><label>React to</label><div>
+      <label style="display:block;margin-bottom:6px"><input type="checkbox" name="ev_inherit" checked> Use global setting (<span id="gev"></span>)</label>
+      <div id="evc" class="row">${TYPES.map(([t, l]) => `<label><input type="checkbox" name="ev_${t}" checked> ${l}</label>`).join('')}</div></div></div>
     <div class="row"><button class="btn" type="submit">Save</button><button class="btn sec" type="button" id="tst">Test</button></div>
     <pre id="tr" class="hidden"></pre></form></div>`;
-  $('#cl').innerHTML = cams.map(c => `<div class="panel pcard"><div class="grow"><b>${esc(c.name)}</b> <span style="color:var(--mut)">${esc(c.mode)} ${esc(c.host || '')}</span><br>
+  $('#cl').innerHTML = cams.map(c => `<div class="panel pcard"><div class="grow"><b>${esc(c.name)}</b> <span style="color:var(--mut)">${esc(c.mode)} ${esc(c.host || '')} · ${esc(c.recording_path || 'no recording directory')} · ${esc((c.events || gev).join(', '))}</span><br>
       <span class="${c.status?.connected ? 'ok' : 'bad'}">${c.mode === 'webhook' ? 'webhook' : c.status?.connected ? 'connected' : esc(c.status?.error || 'connecting…')}</span></div>
       <button class="btn sec" data-ed="${c.id}">Edit</button><button class="btn bad" data-dl="${c.id}">Delete</button></div>`).join('');
-  const f = $('#cf'), read = () => { const o = Object.fromEntries(new FormData(f)); o.https = f.https.checked; o.port = o.port ? +o.port : null; o.channel = +o.channel || 0; return o; };
+  const f = $('#cf');
+  $('#gev').textContent = gev.join(', ');
+  const syncEv = () => TYPES.forEach(([t]) => { f['ev_' + t].disabled = f.ev_inherit.checked; });
+  f.ev_inherit.onchange = syncEv; syncEv();
+  const read = () => {
+    const o = Object.fromEntries(new FormData(f));
+    o.https = f.https.checked; o.port = o.port ? +o.port : null; o.channel = +o.channel || 0;
+    o.events = f.ev_inherit.checked ? null : TYPES.map(([t]) => t).filter(t => f['ev_' + t].checked);
+    for (const k of Object.keys(o)) if (k.startsWith('ev_')) delete o[k];
+    return o;
+  };
   f.onsubmit = async ev => { ev.preventDefault(); const o = read(), ex = cams.find(c => c.name === o.name);
-    await api(ex ? 'cameras/' + ex.id : 'cameras', {method: ex ? 'PUT' : 'POST', body: o}); render(); };
+    try { await api(ex ? 'cameras/' + ex.id : 'cameras', {method: ex ? 'PUT' : 'POST', body: o}); render(); }
+    catch (e) { alert(e.message); } };
   $('#tst').onclick = async () => { const r = $('#tr'); r.classList.remove('hidden'); r.textContent = 'testing…';
     try { r.textContent = JSON.stringify(await api('cameras/test', {method: 'POST', body: read()}), null, 2); } catch (e) { r.textContent = e.message; } };
   $('#cl').querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { const c = cams.find(x => x.id === b.dataset.ed);
-    for (const [k, v] of Object.entries(c)) { const i = f.elements[k]; if (i && k !== 'password') i.type === 'checkbox' ? i.checked = !!v : i.value = v ?? ''; } scrollTo(0, 1e5); });
+    for (const [k, v] of Object.entries(c)) { const i = f.elements[k]; if (i && k !== 'password' && k !== 'events') i.type === 'checkbox' ? i.checked = !!v : i.value = v ?? ''; }
+    f.ev_inherit.checked = !(c.events && c.events.length);
+    TYPES.forEach(([t]) => { f['ev_' + t].checked = !c.events || !c.events.length || c.events.includes(t); }); syncEv();
+    scrollTo(0, 1e5); });
   $('#cl').querySelectorAll('[data-dl]').forEach(b => b.onclick = async () => { if (confirm('Delete camera?')) { await api('cameras/' + b.dataset.dl, {method: 'DELETE'}); render(); } });
 }
 
@@ -186,17 +221,24 @@ const FIELDS = [
   ['frames_per_event', 'Frames per person event (3-5)', 'number'], ['frame_interval_ms', 'Frame interval (ms)', 'number'],
   ['match_threshold', 'Match threshold (cosine)', 'number'], ['auto_learn_threshold', 'Auto-learn threshold (0 = off)', 'number'],
   ['min_face_px', 'Min. face size (px)', 'number'], ['min_det_score', 'Min. detector score', 'number'],
-  ['event_cooldown_seconds', 'Event cooldown (s)', 'number'], ['retention_days', 'Retention (days, 0 = keep)', 'number']];
+  ['event_cooldown_seconds', 'Event cooldown (s)', 'number'], ['retention_days', 'Retention (days, 0 = keep)', 'number'],
+  ['recording_timezone', 'Recording file time zone', 'text'], ['recording_link_timeout_seconds', 'Wait for recording upload (s)', 'number']];
 async function viewSettings(m) {
   const [s, sys] = await Promise.all([api('settings'), api('system')]);
-  m.innerHTML = `<div class="panel"><h3>Runtime settings</h3><form id="sf">${FIELDS.map(([k, l, t]) =>
+  const on = s.event_types || [];
+  m.innerHTML = `<div class="panel"><h3>Runtime settings</h3><form id="sf">
+    <div class="f"><label>React to events</label><div class="row">${TYPES.map(([t, l]) =>
+      `<label><input type="checkbox" name="ev_${t}" ${on.includes(t) ? 'checked' : ''}> ${l}</label>`).join('')}</div></div>
+    <p style="color:var(--mut);font-size:12px;margin:-2px 0 10px">Global default. A camera can override it in its own settings. Events of other types are ignored completely (no snapshot, no clip, no recording link).</p>
+    ${FIELDS.map(([k, l, t]) =>
     `<div class="f"><label>${l}</label><input name="${k}" type="${t}" step="any" value="${esc(s[k])}"></div>`).join('')}
     <button class="btn">Save</button></form></div>
     <div class="panel"><h3>System</h3><p style="color:var(--mut)">Storage path, model, inference device and API token are set in the add-on configuration (Settings → Add-ons → TheBoringNVR → Configuration).</p>
     <pre>storage: ${esc(sys.storage)}\nface engine: ${esc(sys.engine)}\nversion: ${esc(sys.version)}\nAPI token (for the Lovelace card): ${esc(sys.api_token)}</pre></div>`;
   $('#sf').onsubmit = async e => { e.preventDefault(); const o = {};
     for (const [k, , t] of FIELDS) o[k] = t === 'number' ? +e.target[k].value : e.target[k].value;
-    await api('settings', {method: 'PUT', body: o}); render(); };
+    o.event_types = TYPES.map(([t]) => t).filter(t => e.target['ev_' + t].checked);
+    try { await api('settings', {method: 'PUT', body: o}); render(); } catch (err) { alert(err.message); } };
 }
 render();
 </script>
