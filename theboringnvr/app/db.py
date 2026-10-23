@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS embeddings(
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, camera TEXT NOT NULL, type TEXT NOT NULL, ts REAL NOT NULL,
   person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
-  confidence REAL, snapshot TEXT, face TEXT, clip TEXT, status TEXT DEFAULT 'new');
+  confidence REAL, snapshot TEXT, face TEXT, clip TEXT, status TEXT DEFAULT 'new',
+  recording TEXT, rec_offset REAL, rec_status TEXT DEFAULT 'pending');
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_cam ON events(camera, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id, ts DESC);
@@ -38,7 +39,20 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.emb_version = 0   # bumped whenever embeddings change -> engine reloads its matrix
+
+    def _migrate(self) -> None:
+        """Databases created by 0.1.x lack the recording columns."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "recording" in cols:
+            return
+        with self.lock:
+            self.conn.execute("ALTER TABLE events ADD COLUMN recording TEXT")
+            self.conn.execute("ALTER TABLE events ADD COLUMN rec_offset REAL")
+            self.conn.execute("ALTER TABLE events ADD COLUMN rec_status TEXT DEFAULT 'none'")
+            self.conn.execute("UPDATE events SET rec_status='none'")
+            self.conn.commit()
 
     def q(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
         with self.lock:

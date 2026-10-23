@@ -1,5 +1,5 @@
 name: TheBoringNVR
-version: "0.1.1"
+version: "0.2.0"
 slug: theboringnvr
 description: Event-driven NVR with HomeKit-Secure-Video-style face recognition for Reolink + go2rtc
 url: https://github.com/theboringalex/TheBoringNVR
@@ -22,7 +22,7 @@ ports:
 ports_description:
   8099/tcp: "NVR API for TheBoringCameraCardv2 (token protected)"
 
-# Recordings / snapshots / DB live here by default. Change storage_path to /media/... if you prefer.
+# /share and /media: add-on storage and the cameras' recording directories (FTP targets, network shares).
 map:
   - share:rw
   - media:rw

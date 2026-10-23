@@ -1,18 +1,22 @@
 """Event pipeline + camera manager.
 
-camera event -> DB row + snapshot (instant) -> [person: 3-5 frames -> face engine -> person/review]
-             -> clip (pre-roll + post-roll) -> SSE update to the GUI / card
+camera event -> event filter (global / per-camera types) -> DB row + snapshot (instant)
+             -> [person: 3-5 frames -> face engine -> person/review]
+             -> clip (pre-roll + post-roll)  -> link to the camera's own recording (FTP etc.)
+             -> SSE update to the GUI / card
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
+from .recording_index import RecordingIndex
 from .reolink_listener import ReolinkListener
 
 log = logging.getLogger("nvr.pipeline")
@@ -22,6 +26,7 @@ class Pipeline:
     def __init__(self, cfg, db, cams, go2rtc, engine, recorder) -> None:
         self.cfg, self.db, self.cams = cfg, db, cams
         self.go2rtc, self.engine, self.recorder = go2rtc, engine, recorder
+        self.recindex = RecordingIndex(cfg)
         self.listeners: dict[str, ReolinkListener] = {}
         self.listener_tasks: dict[str, asyncio.Task] = {}
         self.subscribers: set[asyncio.Queue] = set()
@@ -38,7 +43,9 @@ class Pipeline:
         if cam.get("buffer", True):
             await self.recorder.start(cam_id, src)
         if cam.get("mode", "reolink") == "reolink":
-            lst = ReolinkListener(cam_id, cam, self.handle_event, verify_tls=bool(self.cfg.verify_tls))
+            # the listener reports everything; handle_event() applies the global / per-camera event filter
+            lst = ReolinkListener(cam_id, {**cam, "events": None}, self.handle_event,
+                                  verify_tls=bool(self.cfg.verify_tls))
             self.listeners[cam_id] = lst
             self.listener_tasks[cam_id] = asyncio.create_task(lst.run())
 
@@ -52,6 +59,13 @@ class Pipeline:
     async def start_all(self) -> None:
         for cam_id in list(self.cams.cams):
             await self.start_camera(cam_id)
+        # events whose recording was still pending when the add-on stopped
+        for ev in self.db.q("SELECT id, camera, ts FROM events WHERE rec_status='pending' LIMIT 500"):
+            asyncio.create_task(self._link_recording(ev["id"], ev["camera"], ev["ts"]))
+
+    def effective_events(self, cam: dict) -> list[str]:
+        """Event types a camera reacts to: its own list, else the global setting."""
+        return list(cam.get("events") or self.cfg.event_types)
 
     def status(self) -> dict:
         return {cid: {"connected": l.connected, "error": l.last_error} for cid, l in self.listeners.items()}
@@ -81,7 +95,9 @@ class Pipeline:
         m = lambda v: f"/api/media/{v}" if v else None  # noqa: E731
         return {"id": ev["id"], "camera": ev["camera"], "type": ev["type"], "ts": ev["ts"],
                 "person": person, "confidence": ev["confidence"], "status": ev["status"],
-                "snapshot": m(ev["snapshot"]), "face": m(ev["face"]), "clip": m(ev["clip"])}
+                "snapshot": m(ev["snapshot"]), "face": m(ev["face"]), "clip": m(ev["clip"]),
+                "recording": f"/api/events/{ev['id']}/recording" if ev.get("recording") else None,
+                "rec_offset": ev.get("rec_offset"), "rec_status": ev.get("rec_status")}
 
     def publish_event(self, event_id: int) -> None:
         ev = self.db.one("SELECT * FROM events WHERE id=?", (event_id,))
@@ -92,6 +108,8 @@ class Pipeline:
     async def handle_event(self, cam_id: str, etype: str, ts: float | None = None) -> int | None:
         cam = self.cams.get(cam_id)
         if not cam:
+            return None
+        if etype not in self.effective_events(cam):
             return None
         ts = ts or time.time()
         cd = self.cfg.event_cooldown_seconds
@@ -104,7 +122,9 @@ class Pipeline:
         src = cam.get("go2rtc_src") or cam_id
         d = self.event_dir(cam_id, ts)
         d.mkdir(parents=True, exist_ok=True)
-        event_id = self.db.x("INSERT INTO events(camera,type,ts,status) VALUES(?,?,?,'new')", (cam_id, etype, ts))
+        rec_status = "pending" if cam.get("recording_path") else "none"
+        event_id = self.db.x("INSERT INTO events(camera,type,ts,status,rec_status) VALUES(?,?,?,'new',?)",
+                             (cam_id, etype, ts, rec_status))
         try:
             jpg = await self.go2rtc.snapshot(src)
             snap = d / f"{event_id}_snap.jpg"
@@ -115,9 +135,51 @@ class Pipeline:
         self.publish_event(event_id)
 
         asyncio.create_task(self._clip(event_id, cam_id, ts, d))
+        if rec_status == "pending":
+            asyncio.create_task(self._link_recording(event_id, cam_id, ts))
         if etype == "person":
             asyncio.create_task(self._faces(event_id, cam_id, src, d))
         return event_id
+
+    # ---------- link to the camera's own recording ----------
+    async def _link_recording(self, event_id: int, cam_id: str, ts: float, wait_from: float | None = None) -> None:
+        """Poll the camera's recording directory until a file covering `ts` shows up (FTP upload is delayed)."""
+        deadline = (wait_from or ts) + float(self.cfg.recording_link_timeout_seconds)
+        await asyncio.sleep(5)
+        while True:
+            cam = self.cams.get(cam_id)
+            root = (cam or {}).get("recording_path")
+            if not root:
+                self.db.x("UPDATE events SET rec_status='none' WHERE id=? AND rec_status='pending'", (event_id,))
+                return
+            hit = None
+            try:
+                hit = await self.recindex.find(root, ts, pre_roll=float(self.cfg.pre_roll_seconds))
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] recording lookup failed", cam_id)
+            if hit:
+                path, offset = hit
+                rel = os.path.relpath(path, root)
+                self.db.x("UPDATE events SET recording=?, rec_offset=?, rec_status='linked' WHERE id=?",
+                          (rel, offset, event_id))
+                self.publish_event(event_id)
+                log.info("[%s] event %s linked to %s (+%.0fs)", cam_id, event_id, rel, offset)
+                return
+            if time.time() > deadline:
+                self.db.x("UPDATE events SET rec_status='missing' WHERE id=? AND rec_status='pending'", (event_id,))
+                self.publish_event(event_id)
+                log.warning("[%s] no recording found for event %s", cam_id, event_id)
+                return
+            await asyncio.sleep(10)
+
+    def relink(self, event_id: int) -> bool:
+        ev = self.db.one("SELECT id, camera, ts FROM events WHERE id=?", (event_id,))
+        if not ev:
+            return False
+        self.db.x("UPDATE events SET rec_status='pending', recording=NULL, rec_offset=NULL WHERE id=?", (event_id,))
+        # a manual retry gets a fresh waiting window
+        asyncio.create_task(self._link_recording(event_id, ev["camera"], ev["ts"], wait_from=time.time()))
+        return True
 
     async def _clip(self, event_id: int, cam_id: str, ts: float, d: Path) -> None:
         out = d / f"{event_id}_clip.mp4"
@@ -169,6 +231,8 @@ class Pipeline:
 
     # ---------- retention ----------
     async def retention_loop(self) -> None:
+        """Removes NVR-owned files only (snapshots, face crops, buffer clips). The camera's own recordings
+        in `recording_path` are never touched - rotate those on the camera / FTP side."""
         while True:
             await asyncio.sleep(3600)
             days = int(self.cfg.retention_days)

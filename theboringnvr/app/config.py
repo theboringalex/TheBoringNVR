@@ -39,13 +39,21 @@ DEFAULTS: dict[str, Any] = {
     "verify_tls": False,
     "log_level": "info",
     "buffer_path": "/tmp/theboringnvr-buffer",
+    # which camera events are processed at all (a camera can override this list)
+    "event_types": ["person", "vehicle", "animal", "motion"],
+    # camera recordings (FTP etc.) are linked to events by timestamp
+    "recording_timezone": "Europe/Berlin",       # timezone of the time stamps in the recording file names
+    "recording_link_timeout_seconds": 900,       # how long to wait for the camera to upload the file
 }
+
+EVENT_TYPES = ("person", "vehicle", "animal", "motion")
 
 # Keys that may be changed at runtime from the GUI (the rest needs the HA add-on options page).
 EDITABLE = {
     "go2rtc_url", "go2rtc_rtsp_port", "pre_roll_seconds", "post_roll_seconds",
     "frames_per_event", "frame_interval_ms", "match_threshold", "auto_learn_threshold",
     "min_face_px", "min_det_score", "event_cooldown_seconds", "retention_days",
+    "event_types", "recording_timezone", "recording_link_timeout_seconds",
 }
 
 
@@ -110,7 +118,7 @@ def slugify(name: str) -> str:
 
 class CameraStore:
     """cameras.json: {id: {name, mode, host, port, https, username, password, channel,
-    go2rtc_src, events, buffer}}"""
+    go2rtc_src, events (null = use the global event_types), recording_path, buffer}}"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

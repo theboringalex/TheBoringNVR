@@ -6,3 +6,4 @@ numpy<2
 opencv-python-headless==4.10.0.84
 pillow>=10.0
 insightface==0.7.3
+tzdata

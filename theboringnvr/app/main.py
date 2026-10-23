@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -14,12 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .config import CameraStore, Settings
+from .config import EVENT_TYPES, CameraStore, Settings
 from .db import DB
 from .services.face_engine import FaceEngine
 from .services.go2rtc_client import Go2RTC
 from .services.pipeline import Pipeline, sse_format
 from .services.recorder import Recorder
+from .services.recording_index import check_dir, valid_recording_path
 from .services.reolink_listener import ReolinkListener
 
 INGRESS_IP = "172.30.32.2"   # HA supervisor ingress proxy
@@ -78,8 +80,9 @@ class CameraIn(BaseModel):
     password: str = ""
     channel: int = 0
     go2rtc_src: str = ""
-    events: list[str] = ["person", "vehicle", "animal", "motion"]
-    buffer: bool = True
+    events: list[str] | None = None      # None / empty = use the global event types from Settings
+    recording_path: str = ""             # where the camera stores its own recordings (FTP target etc.)
+    buffer: bool = True                  # internal pre-roll ring buffer (fallback clip)
 
 
 class PersonIn(BaseModel):
@@ -94,8 +97,8 @@ class AssignIn(BaseModel):
 # ------------------------------------------------------------------ system
 @api.get("/system")
 async def system():
-    return {"version": "0.1.1", "engine": engine.provider_in_use, "cameras": pipe.status(),
-            "api_token": cfg.api_token, "storage": str(cfg.storage)}
+    return {"version": "0.2.0", "engine": engine.provider_in_use, "cameras": pipe.status(),
+            "api_token": cfg.api_token, "storage": str(cfg.storage), "event_types": list(EVENT_TYPES)}
 
 
 @api.get("/settings")
@@ -105,6 +108,17 @@ async def get_settings():
 
 @api.put("/settings")
 async def put_settings(patch: dict):
+    if "event_types" in patch:
+        types = [t for t in (patch["event_types"] or []) if t in EVENT_TYPES]
+        if not types:
+            raise HTTPException(422, "select at least one event type")
+        patch["event_types"] = types
+    if "recording_timezone" in patch:
+        from zoneinfo import ZoneInfo
+        try:
+            ZoneInfo(str(patch["recording_timezone"]))
+        except Exception:  # noqa: BLE001
+            raise HTTPException(422, "unknown timezone - use an IANA name like Europe/Berlin")
     return cfg.update(patch)
 
 
@@ -117,9 +131,26 @@ async def list_cameras():
     return out
 
 
+def camera_data(c: CameraIn) -> dict:
+    """Validate and normalise a camera before it is stored. A recording directory is mandatory so every
+    event can be linked to the camera's own recording."""
+    ok, msg = valid_recording_path(c.recording_path)
+    if not ok:
+        raise HTTPException(422, msg)
+    data = c.model_dump()
+    data["recording_path"] = os.path.normpath(c.recording_path.strip())
+    if data["events"]:
+        bad = set(data["events"]) - set(EVENT_TYPES)
+        if bad:
+            raise HTTPException(422, f"unknown event type(s): {', '.join(sorted(bad))}")
+    else:
+        data["events"] = None
+    return data
+
+
 @api.post("/cameras")
 async def add_camera(c: CameraIn):
-    cam_id = cams.upsert(c.model_dump())
+    cam_id = cams.upsert(camera_data(c))
     await pipe.start_camera(cam_id)
     return {"id": cam_id}
 
@@ -128,7 +159,7 @@ async def add_camera(c: CameraIn):
 async def edit_camera(cam_id: str, c: CameraIn):
     if not cams.get(cam_id):
         raise HTTPException(404)
-    cams.upsert(c.model_dump(), cam_id)
+    cams.upsert(camera_data(c), cam_id)
     await pipe.start_camera(cam_id)
     return {"id": cam_id}
 
@@ -142,7 +173,8 @@ async def del_camera(cam_id: str):
 
 @api.post("/cameras/test")
 async def test_camera(c: CameraIn):
-    res: dict = {"go2rtc": await go2rtc.test(c.go2rtc_src or c.name)}
+    res: dict = {"go2rtc": await go2rtc.test(c.go2rtc_src or c.name),
+                 "recording": await asyncio.to_thread(check_dir, c.recording_path)}
     if c.mode == "reolink":
         data = c.model_dump()
         if not data["password"]:     # re-test an existing camera without retyping the password
@@ -172,7 +204,7 @@ async def cam_webrtc(cam_id: str):
 @api.post("/webhook/{cam_id}")
 async def webhook(cam_id: str, type: str = "person"):
     """For cameras without a state API: POST here when the camera/automation sees something."""
-    if type not in {"person", "vehicle", "animal", "motion"}:
+    if type not in EVENT_TYPES:
         raise HTTPException(400, "type must be person|vehicle|animal|motion")
     return {"event_id": await pipe.handle_event(cam_id, type)}
 
@@ -226,6 +258,28 @@ async def event(event_id: int):
     if not ev:
         raise HTTPException(404)
     return pipe.event_json(ev)
+
+
+@api.get("/events/{event_id}/recording")
+async def event_recording(event_id: int):
+    """The camera's own recording that covers this event (play from `rec_offset` seconds)."""
+    ev = db.one("SELECT camera, recording FROM events WHERE id=?", (event_id,))
+    cam = cams.get(ev["camera"]) if ev else None
+    if not ev or not ev["recording"] or not cam or not cam.get("recording_path"):
+        raise HTTPException(404)
+    root = Path(cam["recording_path"]).resolve()
+    path = (root / ev["recording"]).resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path)
+
+
+@api.post("/events/{event_id}/relink")
+async def relink_event(event_id: int):
+    """Search the recording directory again (e.g. after a late FTP upload)."""
+    if not pipe.relink(event_id):
+        raise HTTPException(404)
+    return {"ok": True}
 
 
 @api.delete("/events/{event_id}")
